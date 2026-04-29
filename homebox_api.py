@@ -177,6 +177,14 @@ class HomeBoxClient:
         # API wraps response in {"item": {...}}
         return data.get("item", data)
 
+    async def get_attachment(self, item_id: str, attachment_id: str) -> bytes:
+        resp = await self._client.get(
+            f"{self.base_url}/items/{item_id}/attachments/{attachment_id}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.content
+
 
 def run_client(coro):
     """Run an async coroutine that receives a connected HomeBoxClient."""

@@ -16,6 +16,8 @@
           click
           textual
           rich
+          opencv4   # webcam capture (cv2)
+          pillow    # image rotation
         ]);
       in {
         devShells.default = pkgs.mkShell {
