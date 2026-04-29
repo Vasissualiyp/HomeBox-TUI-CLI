@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+import pathlib
 import httpx
 
 
@@ -56,6 +57,22 @@ class HomeBoxClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def _post(self, path: str, payload: dict) -> any:
+        resp = await self._client.post(
+            f"{self.base_url}{path}",
+            headers=self._headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _delete(self, path: str) -> None:
+        resp = await self._client.delete(
+            f"{self.base_url}{path}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+
     # --- Items ---
 
     async def get_items(
@@ -95,6 +112,31 @@ class HomeBoxClient:
     async def get_item(self, item_id: str) -> dict:
         return await self._get(f"/items/{item_id}")
 
+    async def create_item(self, payload: dict) -> dict:
+        """payload: name, description, quantity, locationId"""
+        return await self._post("/items", payload)
+
+    async def delete_item(self, item_id: str) -> None:
+        await self._delete(f"/items/{item_id}")
+
+    async def upload_item_image(self, item_id: str, file_path: str) -> dict:
+        p = pathlib.Path(file_path).expanduser().resolve()
+        suffix = p.suffix.lower().lstrip(".")
+        mime = {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "webp": "image/webp",
+        }.get(suffix, "application/octet-stream")
+        with open(p, "rb") as f:
+            content = f.read()
+        resp = await self._client.post(
+            f"{self.base_url}/items/{item_id}/attachments",
+            headers=self._headers(),
+            files={"file": (p.name, content, mime)},
+            data={"type": "photo", "name": p.name},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # --- Locations ---
 
     async def get_locations(self) -> list[dict]:
@@ -105,6 +147,15 @@ class HomeBoxClient:
 
     async def get_location_tree(self) -> list[dict]:
         return await self._get("/locations/tree")
+
+    async def create_location(self, name: str, description: str = "", parent_id: str | None = None) -> dict:
+        payload: dict = {"name": name, "description": description}
+        if parent_id:
+            payload["parentId"] = parent_id
+        return await self._post("/locations", payload)
+
+    async def delete_location(self, location_id: str) -> None:
+        await self._delete(f"/locations/{location_id}")
 
     # --- Tags (called "labels" in older docs, "tags" in v0.24+) ---
 
