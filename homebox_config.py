@@ -94,24 +94,72 @@ def is_kitty_supported() -> bool:
     )
 
 
-def display_kitty_image(path: str) -> None:
-    """Write a kitty graphics protocol image to stdout."""
-    import base64
-    import sys
+def _kitty_wrap(data: bytes) -> bytes:
+    """Wrap kitty APC data in tmux DCS passthrough when needed."""
+    import os
+    if not os.environ.get("TMUX"):
+        return data
+    escaped = data.replace(b"\x1b", b"\x1b\x1b")
+    return b"\x1bPtmux;" + escaped + b"\x1b\\"
 
-    with open(path, "rb") as f:
-        raw = f.read()
-    b64 = base64.standard_b64encode(raw).decode()
+
+def _kitty_write(data: bytes) -> None:
+    """Write kitty graphics bytes, with tmux passthrough if needed."""
+    import os
+    os.write(1, _kitty_wrap(data))
+
+
+def _kitty_delete_all() -> None:
+    """Delete all kitty images from the terminal."""
+    try:
+        _kitty_write(b"\033_Ga=d,q=2;\033\\")
+    except Exception:
+        pass
+
+
+def _kitty_delete_id(image_id: int) -> None:
+    """Delete a specific kitty image by ID."""
+    try:
+        _kitty_write(f"\033_Ga=d,d=i,i={image_id},q=2;\033\\".encode())
+    except Exception:
+        pass
+
+
+def display_kitty_bytes(raw: bytes, image_id: int = 0) -> None:
+    """Display raw image bytes (PNG/JPEG) via kitty graphics protocol.
+
+    If *image_id* > 0, the image is assigned that ID so it can be
+    replaced or deleted later.
+    """
+    import base64, io
+    from PIL import Image
+
+    # Resize to fit terminal (approximate 80 cols × 24 rows)
+    img = Image.open(io.BytesIO(raw))
+    img.thumbnail((640, 480), Image.LANCZOS)
+    png_buf = io.BytesIO()
+    img.save(png_buf, format="PNG", optimize=True)
+    png_bytes = png_buf.getvalue()
+
+    id_part = f",i={image_id}" if image_id else ""
+
+    b64 = base64.standard_b64encode(png_bytes).decode()
     chunks = [b64[i : i + 4096] for i in range(0, len(b64), 4096)]
     buf = bytearray()
     for i, chunk in enumerate(chunks):
         more = 0 if i == len(chunks) - 1 else 1
         if i == 0:
-            buf += f"\033_Ga=T,f=100,m={more};{chunk}\033\\".encode()
+            buf += f"\033_Ga=T,f=100,q=2{id_part},m={more};{chunk}\033\\".encode()
         else:
             buf += f"\033_Gm={more};{chunk}\033\\".encode()
-    sys.stdout.buffer.write(buf)
-    sys.stdout.buffer.flush()
+    _kitty_write(buf)
+
+
+def display_kitty_image(path: str) -> None:
+    """Write a kitty graphics protocol image to stdout."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    display_kitty_bytes(raw)
 
 
 def display_image(path: str) -> None:
@@ -125,7 +173,6 @@ def display_image(path: str) -> None:
         if is_kitty_supported():
             display_kitty_image(path)
         else:
-            # Fallback: external viewer
             viewer = "external"
 
     if viewer == "external":
@@ -138,59 +185,32 @@ def display_image(path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def capture_webcam(device: int = 0) -> str | None:
-    """Open webcam, show live preview, let user capture a frame.
+    """Capture a frame from the webcam with optional live kitty preview.
 
-    Runs synchronously (call from a background thread or suspended TUI).
+    Runs the actual capture in a **subprocess** so that all terminal I/O
+    (setcbreak, kitty escapes, select) is fully isolated from Textual's
+    driver threads.  This prevents the deadlocks that occur when writing
+    to fd 1 inside ``app.suspend()``.
+
     Returns path to saved JPEG, or None if cancelled.
     """
-    import tempfile
+    import os, sys, subprocess, tempfile
+
+    result_file = tempfile.mktemp(suffix=".path")
     try:
-        import cv2
-    except ImportError:
-        print("\n[Error] opencv not available. Install cv2 to use webcam capture.\n")
-        input("Press Enter to continue...")
-        return None
-
-    cap = cv2.VideoCapture(device)
-    if not cap.isOpened():
-        print(f"\n[Error] Cannot open webcam device {device}.\n")
-        input("Press Enter to continue...")
-        return None
-
-    print("\n  Webcam preview — SPACE/Enter: capture | q/Esc: cancel\n")
-    captured = None
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        display = frame.copy()
-        cv2.putText(
-            display,
-            "SPACE/Enter: capture | q/Esc: cancel",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
+        subprocess.run(
+            [sys.executable, "-u", os.path.join(os.path.dirname(__file__), "homebox_capture.py"),
+             str(device), result_file],
         )
-        cv2.imshow("HomeBox — Capture Photo", display)
-        key = cv2.waitKey(30) & 0xFF
-        if key in (32, 13):  # space or enter
-            captured = frame
-            break
-        elif key in (ord("q"), 27):  # q or escape
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    if captured is None:
+    except Exception:
         return None
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    cv2.imwrite(tmp.name, captured)
-    tmp.close()
-    return tmp.name
+    if os.path.exists(result_file):
+        with open(result_file) as f:
+            path = f.read().strip()
+        os.unlink(result_file)
+        return path if path and os.path.exists(path) else None
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -371,17 +371,22 @@ class BulkIndexScreen(Screen):
 
     def _do_capture(self, after_start: bool = False) -> None:
         """Suspend TUI, open webcam, capture a frame."""
-        self.run_worker(self._capture_thread, thread=True, exclusive=True, group="capture")
         if after_start:
             self._pending_goto_review = True
+        self.run_worker(self._capture_coro(), exclusive=True, group="capture")
 
     _pending_goto_review: bool = False
 
-    def _capture_thread(self) -> None:
-        """Runs in background thread — suspends TUI for webcam."""
+    async def _capture_coro(self) -> None:
+        """Async worker — suspend on main thread, subprocess in executor."""
+        import asyncio
+
+        device = self._cfg["webcam"]["device_index"]
         with self.app.suspend():
-            path = capture_webcam(self._cfg["webcam"]["device_index"])
-        self.call_from_thread(self._on_capture_done, path)
+            path = await asyncio.get_event_loop().run_in_executor(
+                None, capture_webcam, device
+            )
+        self._on_capture_done(path)
 
     def _on_capture_done(self, path: str | None) -> None:
         if path is None:
@@ -407,11 +412,12 @@ class BulkIndexScreen(Screen):
     async def _retake_thread(self, old_path: str) -> None:
         import asyncio
 
-        def _blocking():
-            with self.app.suspend():
-                return capture_webcam(self._cfg["webcam"]["device_index"])
+        device = self._cfg["webcam"]["device_index"]
+        with self.app.suspend():
+            path = await asyncio.get_event_loop().run_in_executor(
+                None, capture_webcam, device
+            )
 
-        path = await asyncio.get_event_loop().run_in_executor(None, _blocking)
         if path:
             # Remove old temp file
             try:
@@ -452,18 +458,18 @@ class BulkIndexScreen(Screen):
     async def _view_thread(self, path: str) -> None:
         import asyncio
 
-        def _blocking():
-            with self.app.suspend():
-                from homebox_config import display_kitty_image, is_kitty_supported
-                if is_kitty_supported():
-                    print(f"\n  {pathlib.Path(path).name}\n")
-                    display_kitty_image(path)
-                else:
-                    print(f"\n  Image: {path}\n")
-                print("\nPress Enter to return to HomeBox...")
-                input()
+        def _show():
+            from homebox_config import display_kitty_image, is_kitty_supported
+            if is_kitty_supported():
+                print(f"\n  {pathlib.Path(path).name}\n")
+                display_kitty_image(path)
+            else:
+                print(f"\n  Image: {path}\n")
+            print("\nPress Enter to return to HomeBox...")
+            input()
 
-        await asyncio.get_event_loop().run_in_executor(None, _blocking)
+        with self.app.suspend():
+            await asyncio.get_event_loop().run_in_executor(None, _show)
 
     # --- Phase 3: confirm & submit ---
 

@@ -73,6 +73,7 @@ from textual.widgets import (
 from textual.message import Message
 
 from homebox_api import HomeBoxClient, HomeBoxError
+from homebox_config import _kitty_wrap, _kitty_delete_all, is_kitty_supported
 
 
 # ---------------------------------------------------------------------------
@@ -252,26 +253,13 @@ class KittyImageWidget(Static):
     # tmux helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _in_tmux() -> bool:
-        import os
-        return bool(os.environ.get("TMUX"))
-
-    @staticmethod
-    def _wrap(data: bytes) -> bytes:
-        """Wrap in tmux DCS passthrough if inside tmux."""
-        import os
-        if not os.environ.get("TMUX"):
-            return data
-        escaped = data.replace(b"\x1b", b"\x1b\x1b")
-        return b"\x1bPtmux;" + escaped + b"\x1b\\"
-
     @classmethod
     def _get_pane_offset(cls) -> tuple[int, int]:
         """Return (top_row, left_col) of current tmux pane in terminal space."""
+        import os
         if cls._pane_offset is not None:
             return cls._pane_offset
-        if not cls._in_tmux():
+        if not os.environ.get("TMUX"):
             cls._pane_offset = (0, 0)
             return cls._pane_offset
         import subprocess
@@ -291,13 +279,12 @@ class KittyImageWidget(Static):
     # ------------------------------------------------------------------
 
     def set_image(self, image_bytes: bytes | None) -> None:
-        from homebox_config import is_kitty_supported
         self._raw_bytes = image_bytes
         self._png_bytes = None
 
         # Clear old kitty image
         if is_kitty_supported():
-            self._kitty_delete()
+            _kitty_delete_all()
 
         if image_bytes is None or not is_kitty_supported():
             if image_bytes and not is_kitty_supported():
@@ -306,7 +293,7 @@ class KittyImageWidget(Static):
                 self.update("[dim](no image)[/dim]")
             return
 
-        # Invalidate cached pane offset (might have changed)
+        # Invalidate cached tmux pane offset (might have changed)
         KittyImageWidget._pane_offset = None
 
         try:
@@ -370,18 +357,12 @@ class KittyImageWidget(Static):
                     kitty_buf += f"\033_Gm={more};{chunk}\033\\".encode()
 
             out = bytearray()
-            out += self._wrap(b"\033_Ga=d,q=2;\033\\")  # delete old
-            out += self._wrap(bytes(kitty_buf))           # position + place
+            out += _kitty_wrap(b"\033_Ga=d,q=2;\033\\")  # delete old
+            out += _kitty_wrap(bytes(kitty_buf))           # position + place
             os.write(1, bytes(out))
         except Exception:
             pass
 
-    def _kitty_delete(self) -> None:
-        import os
-        try:
-            os.write(1, self._wrap(b"\033_Ga=d,q=2;\033\\"))
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1097,16 +1078,20 @@ class MainScreen(Screen):
         self.run_worker(self._do_view_image(img_bytes), group="view")
 
     async def _do_view_image(self, img_bytes: bytes) -> None:
-        import tempfile, os
+        import tempfile, os, asyncio
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(img_bytes)
             tmp = f.name
+
+        def _show():
+            from homebox_config import display_image, is_kitty_supported
+            display_image(tmp)
+            if is_kitty_supported():
+                input("\nPress Enter to return to HomeBox…")
+
         try:
-            async with self.app.suspend():
-                from homebox_config import display_image, is_kitty_supported
-                display_image(tmp)
-                if is_kitty_supported():
-                    input("\nPress Enter to return to HomeBox…")
+            with self.app.suspend():
+                await asyncio.get_event_loop().run_in_executor(None, _show)
         finally:
             try:
                 os.unlink(tmp)
