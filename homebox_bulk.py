@@ -63,8 +63,28 @@ class PendingItem:
 # ---------------------------------------------------------------------------
 
 
+def _detect_webcams() -> list[tuple[str, int]]:
+    """Return list of (label, device_index) for available webcams."""
+    import glob
+    devices = sorted(glob.glob("/dev/video*"))
+    if devices:
+        return [(dev, int(dev.replace("/dev/video", ""))) for dev in devices]
+    # Fallback: probe indices 0-3
+    found = []
+    try:
+        import cv2
+        for i in range(4):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                found.append((f"Camera {i}", i))
+            cap.release()
+    except Exception:
+        pass
+    return found if found else [("Camera 0 (default)", 0)]
+
+
 class ChooseLocPanel(Vertical):
-    """Phase 1: pick a location."""
+    """Phase 1: pick a location and optionally a webcam."""
 
     DEFAULT_CSS = """
     ChooseLocPanel {
@@ -73,13 +93,18 @@ class ChooseLocPanel(Vertical):
     }
     ChooseLocPanel Label { margin-bottom: 1; }
     ChooseLocPanel #title { text-style: bold; color: $accent; margin-bottom: 2; }
+    ChooseLocPanel #webcam-row { height: auto; margin-top: 1; }
+    ChooseLocPanel #webcam-toggle { height: 1; margin-bottom: 1; }
+    ChooseLocPanel #sel-webcam { display: none; }
     ChooseLocPanel #btn-row { height: 3; align: right middle; margin-top: 2; }
     ChooseLocPanel #btn-row Button { margin-left: 1; }
     """
 
-    def __init__(self, locations: list[dict], **kwargs) -> None:
+    def __init__(self, locations: list[dict], default_device: int = 0, **kwargs) -> None:
         super().__init__(**kwargs)
         self._locations = locations
+        self._default_device = default_device
+        self._webcams = _detect_webcams()
 
     def compose(self) -> ComposeResult:
         yield Label("Bulk Index — Choose Location", id="title")
@@ -89,9 +114,36 @@ class ChooseLocPanel(Vertical):
             prompt="Select location…",
             id="sel-location",
         )
+        with Vertical(id="webcam-row"):
+            yield Button("▶ Choose webcam device", id="webcam-toggle", variant="default")
+            # Build webcam options; mark default
+            options = []
+            for label, idx in self._webcams:
+                marker = " ✓" if idx == self._default_device else ""
+                options.append((f"{label}{marker}", idx))
+            if not options:
+                options = [("Camera 0 (default)", 0)]
+            yield Select(options, value=self._default_device, id="sel-webcam")
         with Horizontal(id="btn-row"):
             yield Button("Cancel", id="btn-cancel")
             yield Button("Start Capture →", variant="primary", id="btn-start")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "webcam-toggle":
+            sel = self.query_one("#sel-webcam", Select)
+            if sel.display:
+                sel.display = False
+                event.button.label = "▶ Choose webcam device"
+            else:
+                sel.display = True
+                event.button.label = "▼ Choose webcam device"
+            event.stop()
+
+    @property
+    def selected_device(self) -> int:
+        sel = self.query_one("#sel-webcam", Select)
+        v = sel.value
+        return int(v) if v is not Select.BLANK else self._default_device
 
 
 class ReviewPanel(Vertical):
@@ -250,13 +302,14 @@ class BulkIndexScreen(Screen):
         self._items: list[PendingItem] = []
         self._idx: int = 0
         self._cfg = get_config()
+        self._device: int = self._cfg["webcam"]["device_index"]
 
     # --- Layout ---
 
     def compose(self) -> ComposeResult:
         yield Header()
         with ContentSwitcher(initial="choose-loc", id="switcher"):
-            yield ChooseLocPanel(self._locations, id="choose-loc")
+            yield ChooseLocPanel(self._locations, default_device=self._device, id="choose-loc")
             yield ReviewPanel(id="review")
             yield ConfirmPanel(id="confirm")
         yield Footer()
@@ -355,15 +408,15 @@ class BulkIndexScreen(Screen):
     # --- Phase 1: choose location ---
 
     def _start_capture(self) -> None:
-        sel = self.query_one("#sel-location", Select)
-        if sel.value is Select.BLANK:
+        panel = self.query_one(ChooseLocPanel)
+        if panel.query_one("#sel-location", Select).value is Select.BLANK:
             self.notify("Please select a location first", severity="warning")
             return
-        self._location_id = str(sel.value)
+        self._location_id = str(panel.query_one("#sel-location", Select).value)
         loc = next((l for l in self._locations if l["id"] == self._location_id), None)
         self._location_name = loc["name"] if loc else self._location_id
-        self.sub_title = f"Location: {self._location_name}"
-        # Capture first photo immediately
+        self._device = panel.selected_device
+        self.sub_title = f"Location: {self._location_name}  |  Device: /dev/video{self._device}"
         self._do_capture(after_start=True)
 
     # --- Phase 2: review ---
@@ -427,7 +480,7 @@ class BulkIndexScreen(Screen):
         """Async worker — suspend on main thread, subprocess in executor."""
         import asyncio
 
-        device = self._cfg["webcam"]["device_index"]
+        device = self._device
         with self.app.suspend():
             paths = await asyncio.get_event_loop().run_in_executor(
                 None, capture_webcam, device
@@ -458,7 +511,7 @@ class BulkIndexScreen(Screen):
     async def _retake_thread(self, old_path: str) -> None:
         import asyncio
 
-        device = self._cfg["webcam"]["device_index"]
+        device = self._device
         with self.app.suspend():
             paths = await asyncio.get_event_loop().run_in_executor(
                 None, capture_webcam, device
