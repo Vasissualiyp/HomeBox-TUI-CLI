@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Standalone webcam capture helper — run as a subprocess.
 
-Usage: python homebox_capture.py <device_index> <result_file>
+Usage: python homebox_capture.py <device_index> <result_dir>
 
-Captures a frame from the webcam with live kitty-protocol preview.
-On success, writes the path to the saved JPEG into *result_file*.
-On cancel, does not create *result_file*.
+Captures frames from the webcam with live kitty-protocol preview.
+Loops until user presses 'q' — each Enter/Space saves a JPEG to *result_dir*.
 """
 
 import os
@@ -16,6 +15,22 @@ import termios
 import tty
 import base64
 import io
+
+# Use /dev/tty for output to ensure it reaches the terminal even when
+# stdout might be captured by a parent TUI framework.
+try:
+    _TTY_FD = os.open("/dev/tty", os.O_WRONLY)
+except OSError:
+    _TTY_FD = 1  # fallback to stdout
+
+
+def _tty_write(data: bytes) -> None:
+    os.write(_TTY_FD, data)
+
+
+def _tty_print(msg: str) -> None:
+    """Print to /dev/tty so it's always visible."""
+    _tty_write((msg + "\n").encode())
 
 # ---------------------------------------------------------------------------
 # Kitty helpers (self-contained, no imports from homebox_*)
@@ -28,6 +43,7 @@ _KITTY = bool(
     or os.environ.get("TERM_PROGRAM") in ("WezTerm",)
 )
 _PREVIEW_ID = 99
+_IMG_START_ROW = 5  # row where the kitty image is placed
 
 
 def _wrap(data: bytes) -> bytes:
@@ -51,6 +67,8 @@ def _kitty_show(frame_bytes: bytes) -> None:
     out = bytearray()
     # Delete old preview
     out += _wrap(f"\033_Ga=d,d=i,i={_PREVIEW_ID},q=2;\033\\".encode())
+    # Move cursor to image area
+    out += _wrap(f"\033[{_IMG_START_ROW};1H".encode())
     # Transmit + place new preview
     chunks = [b64[i:i + 4096] for i in range(0, len(b64), 4096)]
     kitty_buf = bytearray()
@@ -61,15 +79,25 @@ def _kitty_show(frame_bytes: bytes) -> None:
         else:
             kitty_buf += f"\033_Gm={more};{chunk}\033\\".encode()
     out += _wrap(bytes(kitty_buf))
-    os.write(1, bytes(out))
+    _tty_write(bytes(out))
 
 
 def _kitty_clear() -> None:
     """Remove the preview image."""
     try:
-        os.write(1, _wrap(f"\033_Ga=d,d=i,i={_PREVIEW_ID},q=2;\033\\".encode()))
+        _tty_write(_wrap(f"\033_Ga=d,d=i,i={_PREVIEW_ID},q=2;\033\\".encode()))
     except Exception:
         pass
+
+
+def _draw_header(count: int) -> None:
+    """Draw the status header at the top of the screen."""
+    _tty_write(_wrap(b"\033[H\033[2J"))  # home + clear screen
+    _tty_print("")
+    _tty_print("  Live webcam — Enter/Space: capture | q: done")
+    if count > 0:
+        _tty_print(f"  Photos captured so far: {count}")
+    _tty_print("")
 
 
 # ---------------------------------------------------------------------------
@@ -78,30 +106,37 @@ def _kitty_clear() -> None:
 
 def main() -> None:
     device = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    result_file = sys.argv[2] if len(sys.argv) > 2 else None
+    result_dir = sys.argv[2] if len(sys.argv) > 2 else None
 
     try:
         import cv2
     except ImportError:
-        print("\r\n  [Error] opencv not available.\r\n")
+        _tty_print("\r\n  [Error] opencv not available.\r\n")
         return
 
     cap = cv2.VideoCapture(device)
     if not cap.isOpened():
-        print(f"\r\n  [Error] Cannot open webcam device {device}.\r\n")
+        _tty_print(f"\r\n  [Error] Cannot open webcam device {device}.\r\n")
         return
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
+    # Open /dev/tty for reading too — stdin may be redirected by parent TUI
+    try:
+        tty_in_fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        tty_in_fd = sys.stdin.fileno()
+    tty_in = os.fdopen(tty_in_fd, "rb", buffering=0, closefd=False)
 
-    print("\r\n  Live webcam — Enter/Space: capture | q: cancel\r\n")
-    captured_frame = None
+    old_settings = termios.tcgetattr(tty_in_fd)
+    tty.setcbreak(tty_in_fd)
+
+    captured_paths: list[str] = []
+    _draw_header(0)
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("\r\n  [Error] Lost webcam feed.\r\n")
+                _tty_print("\r\n  [Error] Lost webcam feed.\r\n")
                 break
 
             if _KITTY:
@@ -109,32 +144,38 @@ def main() -> None:
                 _kitty_show(jpg.tobytes())
 
             # Non-blocking key check (~3 FPS)
-            if select.select([sys.stdin], [], [], 0.3)[0]:
-                key = os.read(fd, 1)
+            if select.select([tty_in], [], [], 0.3)[0]:
+                key = os.read(tty_in_fd, 1)
                 if key == b"\x1b":
                     # Drain escape sequence (mouse events etc.)
-                    while select.select([sys.stdin], [], [], 0.01)[0]:
-                        os.read(fd, 64)
+                    while select.select([tty_in], [], [], 0.01)[0]:
+                        os.read(tty_in_fd, 64)
                     continue
                 if key in (b"\n", b"\r", b" "):
-                    captured_frame = frame
-                    break
+                    # Save this frame
+                    if result_dir:
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=".jpg", delete=False, dir=result_dir
+                        )
+                        cv2.imwrite(tmp.name, frame)
+                        tmp.close()
+                        captured_paths.append(tmp.name)
+                    _draw_header(len(captured_paths))
+                    continue  # keep capturing
                 elif key == b"q":
                     break
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_settings)
         if _KITTY:
             _kitty_clear()
-        termios.tcflush(fd, termios.TCIFLUSH)
+        termios.tcflush(tty_in_fd, termios.TCIFLUSH)
 
     cap.release()
 
-    if captured_frame is not None and result_file:
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        cv2.imwrite(tmp.name, captured_frame)
-        tmp.close()
-        with open(result_file, "w") as f:
-            f.write(tmp.name)
+    if captured_paths:
+        _tty_print(f"\r\n  ✓ {len(captured_paths)} photo(s) captured!\r\n")
+    else:
+        _tty_print("\r\n  No photos captured.\r\n")
 
 
 if __name__ == "__main__":

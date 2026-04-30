@@ -184,33 +184,33 @@ def display_image(path: str) -> None:
 # Webcam capture
 # ---------------------------------------------------------------------------
 
-def capture_webcam(device: int = 0) -> str | None:
-    """Capture a frame from the webcam with optional live kitty preview.
+def capture_webcam(device: int = 0) -> list[str]:
+    """Capture frames from the webcam with optional live kitty preview.
 
     Runs the actual capture in a **subprocess** so that all terminal I/O
     (setcbreak, kitty escapes, select) is fully isolated from Textual's
-    driver threads.  This prevents the deadlocks that occur when writing
-    to fd 1 inside ``app.suspend()``.
+    driver threads.
 
-    Returns path to saved JPEG, or None if cancelled.
+    Returns list of paths to saved JPEGs (empty if cancelled/none captured).
     """
     import os, sys, subprocess, tempfile
 
-    result_file = tempfile.mktemp(suffix=".path")
+    result_dir = tempfile.mkdtemp(prefix="homebox_cap_")
     try:
         subprocess.run(
             [sys.executable, "-u", os.path.join(os.path.dirname(__file__), "homebox_capture.py"),
-             str(device), result_file],
+             str(device), result_dir],
         )
     except Exception:
-        return None
+        return []
 
-    if os.path.exists(result_file):
-        with open(result_file) as f:
-            path = f.read().strip()
-        os.unlink(result_file)
-        return path if path and os.path.exists(path) else None
-    return None
+    # Collect all captured JPEGs from the result directory
+    paths = sorted(
+        os.path.join(result_dir, f)
+        for f in os.listdir(result_dir)
+        if f.endswith(".jpg")
+    )
+    return paths
 
 
 # ---------------------------------------------------------------------------

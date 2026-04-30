@@ -109,7 +109,8 @@ class ReviewPanel(Vertical):
         border-left: solid $primary-darken-2;
         padding: 0 1;
     }
-    #image-info-box { height: 1fr; }
+    #review-kitty-img { height: 10; width: 100%; }
+    #image-info-box { height: auto; }
     .field-label { color: $text-muted; margin-top: 1; }
     #review-actions { height: 3; margin-top: 1; }
     #review-actions Button { margin-right: 1; }
@@ -128,7 +129,8 @@ class ReviewPanel(Vertical):
                 yield Label("Quantity", classes="field-label")
                 yield Input(value="1", id="inp-qty")
             with Vertical(id="review-image-panel"):
-                yield Label("Image", classes="field-label")
+                from homebox_tui import KittyImageWidget
+                yield KittyImageWidget(id="review-kitty-img")
                 yield Static("—", id="image-info-box")
         with Horizontal(id="review-actions"):
             yield Button("[c] Capture new", id="btn-capture")
@@ -159,6 +161,14 @@ class ReviewPanel(Vertical):
             f"[bold]{p.name}[/bold]\n{info}\n\n"
             "[dim]v[/dim] view  [dim]r[/dim] rotate CW  [dim]R[/dim] retake"
         )
+        # Show image via kitty protocol
+        try:
+            from homebox_tui import KittyImageWidget
+            with open(item.image_path, "rb") as f:
+                img_bytes = f.read()
+            self.query_one("#review-kitty-img", KittyImageWidget).set_image(img_bytes)
+        except Exception:
+            pass
 
     def get_form_data(self) -> dict:
         try:
@@ -370,7 +380,7 @@ class BulkIndexScreen(Screen):
         self._save_and_advance(+1)
 
     def _do_capture(self, after_start: bool = False) -> None:
-        """Suspend TUI, open webcam, capture a frame."""
+        """Suspend TUI, open webcam, capture photos in a loop."""
         if after_start:
             self._pending_goto_review = True
         self.run_worker(self._capture_coro(), exclusive=True, group="capture")
@@ -383,21 +393,21 @@ class BulkIndexScreen(Screen):
 
         device = self._cfg["webcam"]["device_index"]
         with self.app.suspend():
-            path = await asyncio.get_event_loop().run_in_executor(
+            paths = await asyncio.get_event_loop().run_in_executor(
                 None, capture_webcam, device
             )
-        self._on_capture_done(path)
+        self._on_capture_done(paths)
 
-    def _on_capture_done(self, path: str | None) -> None:
-        if path is None:
-            self.notify("Capture cancelled", severity="warning")
+    def _on_capture_done(self, paths: list[str]) -> None:
+        if not paths:
+            self.notify("No photos captured", severity="warning")
             if not self._items:
-                # Nothing captured, go back to choose-loc
                 self.query_one("#switcher", ContentSwitcher).current = "choose-loc"
             return
-        item = PendingItem(image_path=path)
-        self._items.append(item)
-        self._idx = len(self._items) - 1
+        for p in paths:
+            self._items.append(PendingItem(image_path=p))
+        self._idx = 0
+        self.notify(f"{len(paths)} photo(s) captured")
         self._goto_review()
         self._pending_goto_review = False
 
@@ -414,17 +424,23 @@ class BulkIndexScreen(Screen):
 
         device = self._cfg["webcam"]["device_index"]
         with self.app.suspend():
-            path = await asyncio.get_event_loop().run_in_executor(
+            paths = await asyncio.get_event_loop().run_in_executor(
                 None, capture_webcam, device
             )
 
-        if path:
-            # Remove old temp file
+        if paths:
+            # Use only the first captured photo as replacement
             try:
                 pathlib.Path(old_path).unlink(missing_ok=True)
             except Exception:
                 pass
-            self._items[self._idx].image_path = path
+            self._items[self._idx].image_path = paths[0]
+            # Clean up any extra captures
+            for p in paths[1:]:
+                try:
+                    pathlib.Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
             self._refresh_review()
             self.notify("Photo replaced")
         else:
