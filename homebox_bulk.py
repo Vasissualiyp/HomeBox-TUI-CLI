@@ -112,8 +112,8 @@ class ReviewPanel(Vertical):
     #review-kitty-img { height: 10; width: 100%; }
     #image-info-box { height: auto; }
     .field-label { color: $text-muted; margin-top: 1; }
-    #review-actions { height: 3; margin-top: 1; }
-    #review-actions Button { margin-right: 1; }
+    #skip-indicator { color: $warning; height: auto; margin-top: 1; }
+    #review-shortcuts { height: 1; color: $text-muted; dock: bottom; background: $surface-darken-1; padding: 0 1; }
     """
 
     def compose(self) -> ComposeResult:
@@ -122,25 +122,23 @@ class ReviewPanel(Vertical):
             yield Static("", id="review-status")
         with Horizontal(id="review-body"):
             with Vertical(id="review-form"):
-                yield Label("Name *", classes="field-label")
+                yield Label("[n]ame *", classes="field-label")
                 yield Input(placeholder="Item name", id="inp-name")
-                yield Label("Description", classes="field-label")
+                yield Label("[d]escription", classes="field-label")
                 yield Input(placeholder="Optional", id="inp-desc")
-                yield Label("Quantity", classes="field-label")
+                yield Label("[Q]uantity", classes="field-label")
                 yield Input(value="1", id="inp-qty")
+                yield Static("", id="skip-indicator")
             with Vertical(id="review-image-panel"):
                 from homebox_tui import KittyImageWidget
                 yield KittyImageWidget(id="review-kitty-img")
                 yield Static("—", id="image-info-box")
-        with Horizontal(id="review-actions"):
-            yield Button("[c] Capture new", id="btn-capture")
-            yield Button("[b] Back", id="btn-back")
-            yield Button("[s] Skip", id="btn-skip")
-            yield Button("[v] View", id="btn-view")
-            yield Button("[r] Rotate CW", id="btn-rotate")
-            yield Button("[R] Retake", id="btn-retake")
-            yield Button("Next → [Enter]", variant="primary", id="btn-next")
-            yield Button("[f] Finish", id="btn-finish")
+        yield Static(
+            " [b]ack  [n]ame [d]esc [Q]ty [i]nsert  |"
+            "  [s]kip [v]iew [r]otate [R]etake [c]apture  |"
+            "  Enter:next  [f]inish",
+            id="review-shortcuts",
+        )
 
     def load_item(self, item: PendingItem, index: int, total: int) -> None:
         self.query_one("#review-title", Static).update(
@@ -152,14 +150,19 @@ class ReviewPanel(Vertical):
         self.query_one("#inp-name", Input).value = item.name
         self.query_one("#inp-desc", Input).value = item.description
         self.query_one("#inp-qty", Input).value = str(item.quantity)
+        # Skip indicator
+        skip_w = self.query_one("#skip-indicator", Static)
+        if item.skip:
+            skip_w.update("[bold yellow]⊘ SKIPPED[/bold yellow]  (press [bold]s[/bold] to unskip)")
+        else:
+            skip_w.update("")
         p = pathlib.Path(item.image_path)
         try:
             info = image_info(item.image_path)
         except Exception:
             info = "?"
         self.query_one("#image-info-box", Static).update(
-            f"[bold]{p.name}[/bold]\n{info}\n\n"
-            "[dim]v[/dim] view  [dim]r[/dim] rotate CW  [dim]R[/dim] retake"
+            f"[bold]{p.name}[/bold]\n{info}"
         )
         # Show image via kitty protocol
         try:
@@ -277,7 +280,7 @@ class BulkIndexScreen(Screen):
         elif bid == "btn-back" and current == "review":
             self._save_and_advance(-1)
         elif bid == "btn-skip" and current == "review":
-            self._skip_current()
+            self._toggle_skip()
         elif bid == "btn-capture" and current == "review":
             self._do_capture()
         elif bid == "btn-retake" and current == "review":
@@ -297,19 +300,45 @@ class BulkIndexScreen(Screen):
 
     # --- Keyboard bindings in review phase ---
 
+    def _focus_input(self, input_id: str) -> None:
+        """Focus an input field (enter insert mode)."""
+        inp = self.query_one(f"#{input_id}", Input)
+        inp.focus()
+
+    def _exit_insert(self) -> None:
+        """Leave insert mode — move focus away from any Input."""
+        # Focus the screen itself so shortcuts work
+        self.focus()
+
     def on_key(self, event) -> None:
         if self.query_one("#switcher", ContentSwitcher).current != "review":
             return
-        # Only fire when not in an Input
-        if isinstance(self.focused, Input):
-            return
+
         key = event.key
-        if key == "c":
+
+        # --- Insert mode: Escape exits input focus ---
+        if isinstance(self.focused, Input):
+            if key == "escape":
+                self._exit_insert()
+                event.stop()
+            return
+
+        # --- Normal mode shortcuts ---
+        if key == "n":
+            self._focus_input("inp-name"); event.stop()
+        elif key == "d":
+            self._focus_input("inp-desc"); event.stop()
+        elif key == "Q":
+            self._focus_input("inp-qty"); event.stop()
+        elif key == "i":
+            # Enter insert mode on first input
+            self._focus_input("inp-name"); event.stop()
+        elif key == "c":
             self._do_capture(); event.stop()
         elif key == "b":
             self._save_and_advance(-1); event.stop()
         elif key == "s":
-            self._skip_current(); event.stop()
+            self._toggle_skip(); event.stop()
         elif key == "v":
             self._view_current(); event.stop()
         elif key == "r":
@@ -318,8 +347,10 @@ class BulkIndexScreen(Screen):
             self._do_retake(); event.stop()
         elif key == "f":
             self._goto_confirm(); event.stop()
-        elif key == "enter":
+        elif key in ("enter", "j"):
             self._save_and_advance(+1); event.stop()
+        elif key == "k":
+            self._save_and_advance(-1); event.stop()
 
     # --- Phase 1: choose location ---
 
@@ -373,11 +404,16 @@ class BulkIndexScreen(Screen):
         self._idx = new_idx
         self._refresh_review()
 
-    def _skip_current(self) -> None:
+    def _toggle_skip(self) -> None:
         if not self._items:
             return
-        self._items[self._idx].skip = True
-        self._save_and_advance(+1)
+        item = self._items[self._idx]
+        item.skip = not item.skip
+        if item.skip:
+            self.notify("Marked as skipped")
+        else:
+            self.notify("Unskipped")
+        self._refresh_review()
 
     def _do_capture(self, after_start: bool = False) -> None:
         """Suspend TUI, open webcam, capture photos in a loop."""
