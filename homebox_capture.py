@@ -10,6 +10,7 @@ Loops until user presses 'q' — each Enter/Space saves a JPEG to *result_dir*.
 import os
 import sys
 import select
+import time
 import tempfile
 import termios
 import tty
@@ -29,11 +30,11 @@ def _tty_write(data: bytes) -> None:
 
 
 def _tty_print(msg: str) -> None:
-    """Print to /dev/tty so it's always visible."""
     _tty_write((msg + "\n").encode())
 
+
 # ---------------------------------------------------------------------------
-# Kitty helpers (self-contained, no imports from homebox_*)
+# Kitty helpers — send JPEG directly (no PIL), much lower latency
 # ---------------------------------------------------------------------------
 
 _IN_TMUX = bool(os.environ.get("TMUX"))
@@ -53,29 +54,42 @@ def _wrap(data: bytes) -> bytes:
     return b"\x1bPtmux;" + escaped + b"\x1b\\"
 
 
-def _kitty_show(frame_bytes: bytes) -> None:
-    """Delete previous preview + display new frame via kitty protocol."""
-    from PIL import Image
+_PREVIEW_W = 320
+_PREVIEW_H = 240
 
-    img = Image.open(io.BytesIO(frame_bytes))
-    img.thumbnail((640, 480), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    png = buf.getvalue()
-    b64 = base64.standard_b64encode(png).decode()
+
+def _kitty_show(frame) -> None:
+    """Send a video frame via kitty protocol as PNG (f=100).
+
+    Uses OpenCV for resize + PNG encode at compression level 1 (fast).
+    320×240 PNG level-1 ≈ 30–60 KB — small enough for snappy terminal transfer.
+    """
+    import cv2
+
+    # Resize with OpenCV (fast bilinear)
+    h, w = frame.shape[:2]
+    scale = min(_PREVIEW_W / w, _PREVIEW_H / h, 1.0)
+    sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+    small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_LINEAR)
+
+    # Encode as PNG at compression level 1 (fastest, ~2–4× smaller than raw)
+    _, png = cv2.imencode(".png", small, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    b64 = base64.standard_b64encode(png.tobytes()).decode()
+    chunks = [b64[i:i + 4096] for i in range(0, len(b64), 4096)]
 
     out = bytearray()
     # Delete old preview
     out += _wrap(f"\033_Ga=d,d=i,i={_PREVIEW_ID},q=2;\033\\".encode())
     # Move cursor to image area
     out += _wrap(f"\033[{_IMG_START_ROW};1H".encode())
-    # Transmit + place new preview
-    chunks = [b64[i:i + 4096] for i in range(0, len(b64), 4096)]
+    # Transmit + place: f=100 = PNG (dimensions embedded in PNG header)
     kitty_buf = bytearray()
     for i, chunk in enumerate(chunks):
         more = 0 if i == len(chunks) - 1 else 1
         if i == 0:
-            kitty_buf += f"\033_Ga=T,f=100,q=2,i={_PREVIEW_ID},m={more};{chunk}\033\\".encode()
+            kitty_buf += (
+                f"\033_Ga=T,f=100,q=2,i={_PREVIEW_ID},m={more};{chunk}\033\\"
+            ).encode()
         else:
             kitty_buf += f"\033_Gm={more};{chunk}\033\\".encode()
     out += _wrap(bytes(kitty_buf))
@@ -83,7 +97,6 @@ def _kitty_show(frame_bytes: bytes) -> None:
 
 
 def _kitty_clear() -> None:
-    """Remove the preview image."""
     try:
         _tty_write(_wrap(f"\033_Ga=d,d=i,i={_PREVIEW_ID},q=2;\033\\".encode()))
     except Exception:
@@ -91,7 +104,6 @@ def _kitty_clear() -> None:
 
 
 def _draw_header(count: int) -> None:
-    """Draw the status header at the top of the screen."""
     _tty_write(_wrap(b"\033[H\033[2J"))  # home + clear screen
     _tty_print("")
     _tty_print("  Live webcam — Enter/Space: capture | q: done")
@@ -103,6 +115,10 @@ def _draw_header(count: int) -> None:
 # ---------------------------------------------------------------------------
 # Main capture loop
 # ---------------------------------------------------------------------------
+
+FRAME_INTERVAL = 1.0   # seconds between preview updates (1 FPS)
+KEY_POLL       = 0.05  # seconds between key checks (20 polls/sec → ≤50ms latency)
+
 
 def main() -> None:
     device = int(sys.argv[1]) if len(sys.argv) > 1 else 0
@@ -118,8 +134,10 @@ def main() -> None:
     if not cap.isOpened():
         _tty_print(f"\r\n  [Error] Cannot open webcam device {device}.\r\n")
         return
+    # Minimize internal buffer so cap.read() always returns the latest frame
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # Open /dev/tty for reading too — stdin may be redirected by parent TUI
+    # Open /dev/tty for reading — stdin may be redirected by parent TUI
     try:
         tty_in_fd = os.open("/dev/tty", os.O_RDONLY)
     except OSError:
@@ -132,28 +150,24 @@ def main() -> None:
     captured_paths: list[str] = []
     _draw_header(0)
 
+    # Pre-read the webcam to warm it up (first frame is often slow)
+    cap.read()
+
+    last_frame_time = 0.0
+
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                _tty_print("\r\n  [Error] Lost webcam feed.\r\n")
-                break
-
-            if _KITTY:
-                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                _kitty_show(jpg.tobytes())
-
-            # Non-blocking key check (~3 FPS)
-            if select.select([tty_in], [], [], 0.3)[0]:
+            # --- Key check (fast, non-blocking) ---
+            if select.select([tty_in], [], [], KEY_POLL)[0]:
                 key = os.read(tty_in_fd, 1)
                 if key == b"\x1b":
-                    # Drain escape sequence (mouse events etc.)
                     while select.select([tty_in], [], [], 0.01)[0]:
                         os.read(tty_in_fd, 64)
                     continue
                 if key in (b"\n", b"\r", b" "):
-                    # Save this frame
-                    if result_dir:
+                    # Capture current frame immediately
+                    ret, frame = cap.read()
+                    if ret and result_dir:
                         tmp = tempfile.NamedTemporaryFile(
                             suffix=".jpg", delete=False, dir=result_dir
                         )
@@ -161,16 +175,31 @@ def main() -> None:
                         tmp.close()
                         captured_paths.append(tmp.name)
                     _draw_header(len(captured_paths))
-                    continue  # keep capturing
+                    last_frame_time = 0.0  # force preview refresh
+                    continue
                 elif key == b"q":
                     break
+
+            # --- Frame update (throttled to FRAME_INTERVAL) ---
+            now = time.monotonic()
+            if now - last_frame_time >= FRAME_INTERVAL:
+                ret, frame = cap.read()
+                if not ret:
+                    _tty_print("\r\n  [Error] Lost webcam feed.\r\n")
+                    break
+                if _KITTY:
+                    _kitty_show(frame)
+                last_frame_time = now
+
     finally:
         termios.tcsetattr(tty_in_fd, termios.TCSADRAIN, old_settings)
         if _KITTY:
             _kitty_clear()
         termios.tcflush(tty_in_fd, termios.TCIFLUSH)
-
-    cap.release()
+        # Release in a daemon thread — cap.release() can block 2–4s on USB webcams.
+        # The subprocess exits right after, so the OS closes the fd anyway.
+        import threading
+        threading.Thread(target=cap.release, daemon=True).start()
 
     if captured_paths:
         _tty_print(f"\r\n  ✓ {len(captured_paths)} photo(s) captured!\r\n")

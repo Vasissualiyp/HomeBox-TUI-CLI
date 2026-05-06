@@ -1078,20 +1078,17 @@ class MainScreen(Screen):
         self.run_worker(self._do_view_image(img_bytes), group="view")
 
     async def _do_view_image(self, img_bytes: bytes) -> None:
-        import tempfile, os, asyncio
+        import tempfile, os
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(img_bytes)
             tmp = f.name
 
-        def _show():
-            from homebox_config import display_image, is_kitty_supported
-            display_image(tmp)
-            if is_kitty_supported():
-                input("\nPress Enter to return to HomeBox…")
-
         try:
             with self.app.suspend():
-                await asyncio.get_event_loop().run_in_executor(None, _show)
+                from homebox_config import display_image, is_kitty_supported
+                display_image(tmp)
+                if is_kitty_supported():
+                    input("\nPress Enter to return to HomeBox…")
         finally:
             try:
                 os.unlink(tmp)

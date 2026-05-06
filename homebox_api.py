@@ -66,6 +66,15 @@ class HomeBoxClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def _put(self, path: str, payload: dict) -> any:
+        resp = await self._client.put(
+            f"{self.base_url}{path}",
+            headers=self._headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def _delete(self, path: str) -> None:
         resp = await self._client.delete(
             f"{self.base_url}{path}",
@@ -116,6 +125,9 @@ class HomeBoxClient:
         """payload: name, description, quantity, locationId"""
         return await self._post("/items", payload)
 
+    async def update_item(self, item_id: str, payload: dict) -> dict:
+        return await self._put(f"/items/{item_id}", payload)
+
     async def delete_item(self, item_id: str) -> None:
         await self._delete(f"/items/{item_id}")
 
@@ -164,6 +176,9 @@ class HomeBoxClient:
 
     async def get_tag(self, tag_id: str) -> dict:
         return await self._get(f"/tags/{tag_id}")
+
+    async def create_tag(self, name: str) -> dict:
+        return await self._post("/tags", {"name": name})
 
     # --- Statistics ---
 
