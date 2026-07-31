@@ -166,6 +166,12 @@ class HomeBoxClient:
             payload["parentId"] = parent_id
         return await self._post("/locations", payload)
 
+    async def update_location(self, location_id: str, name: str, description: str = "", parent_id: str | None = None) -> dict:
+        payload: dict = {"name": name, "description": description}
+        if parent_id:
+            payload["parentId"] = parent_id
+        return await self._put(f"/locations/{location_id}", payload)
+
     async def delete_location(self, location_id: str) -> None:
         await self._delete(f"/locations/{location_id}")
 
@@ -191,6 +197,16 @@ class HomeBoxClient:
         data = await self._get("/users/self")
         # API wraps response in {"item": {...}}
         return data.get("item", data)
+
+    async def get_qrcode(self, data: str) -> bytes:
+        """Return raw QR code image bytes for the given data string (e.g. 'loc:<id>')."""
+        resp = await self._client.get(
+            f"{self.base_url}/qrcode",
+            params={"data": data},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.content
 
     async def get_attachment(self, item_id: str, attachment_id: str) -> bytes:
         resp = await self._client.get(
