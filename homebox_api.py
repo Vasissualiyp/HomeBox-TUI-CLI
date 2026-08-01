@@ -167,10 +167,21 @@ class HomeBoxClient:
         return await self._post("/locations", payload)
 
     async def update_location(self, location_id: str, name: str, description: str = "", parent_id: str | None = None) -> dict:
+        # WARNING: HomeBox PUT clears parentId when it is omitted. Always pass the
+        # existing parent_id when you only want to rename — or use rename_location().
         payload: dict = {"name": name, "description": description}
         if parent_id:
             payload["parentId"] = parent_id
         return await self._put(f"/locations/{location_id}", payload)
+
+    async def rename_location(self, location_id: str, new_name: str, description: str | None = None) -> dict:
+        """Rename a location without changing its parent or description."""
+        existing = await self.get_location(location_id)
+        parent_id = None
+        if existing.get("parent"):
+            parent_id = existing["parent"].get("id")
+        desc = description if description is not None else existing.get("description", "")
+        return await self.update_location(location_id, new_name, desc, parent_id=parent_id)
 
     async def delete_location(self, location_id: str) -> None:
         await self._delete(f"/locations/{location_id}")
